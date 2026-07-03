@@ -1,0 +1,115 @@
+# DevOps Network Monitoring Agent Configuration Example
+# 
+# Sensitive credentials can be loaded from environment variables using ${VAR_NAME} syntax
+# or by setting environment variables directly:
+#   - ES_USERNAME, ES_PASSWORD, ES_API_KEY for Elasticsearch
+#   - K8S_KUBECONFIG, K8S_SERVICE_ACCOUNT_TOKEN for Kubernetes
+#   - LLM_API_KEY for LLM providers
+#   - MAILJET_API_KEY, MAILJET_API_SECRET for Mailjet abuse-report delivery
+#   - POSTMARK_SERVER_TOKEN for Postmark abuse-report delivery
+
+mode: analyze
+
+llm:
+  # Provider type: ollama, openai, anthropic, deepseek, groq, or openrouter.
+  # For OpenAI-compatible local servers, use provider: openai and set url to the
+  # base /v1 URL, not /v1/chat/completions.
+  provider: ollama
+  url: http://localhost:11434
+  # API key for hosted providers. Local OpenAI-compatible servers usually accept
+  # any non-empty value, for example "local".
+  api_key: ${LLM_API_KEY}
+  model: llama3.1
+  temperature: 0.1
+
+email:
+  # Provider type: mailjet or postmark.
+  provider: mailjet
+  # Sender must be authorized with the selected provider before live delivery
+  # will succeed.
+  from_email: ${EMAIL_FROM_EMAIL}
+  from_name: ${EMAIL_FROM_NAME}
+  # Set true to validate payloads without delivering email where supported.
+  sandbox_mode: false
+  mailjet:
+    # Mailjet API key and secret. The key is used as HTTP Basic Auth username;
+    # the secret is the password.
+    api_key: ${MAILJET_API_KEY}
+    api_secret: ${MAILJET_API_SECRET}
+    endpoint: https://api.mailjet.com/v3.1/send
+  postmark:
+    # Postmark server token for the configured server. For validation without
+    # delivery, set sandbox_mode true or POSTMARK_SERVER_TOKEN=POSTMARK_API_TEST.
+    server_token: ${POSTMARK_SERVER_TOKEN}
+    endpoint: https://api.postmarkapp.com/email
+    message_stream: outbound
+
+elasticsearch:
+  # Elasticsearch URL
+  url: https://localhost:9200
+  # Username (can be set via ES_USERNAME environment variable or ${ES_USERNAME})
+  username: ${ES_USERNAME}
+  # Password (can be set via ES_PASSWORD environment variable or ${ES_PASSWORD})
+  password: ${ES_PASSWORD}
+  # API key (can be set via ES_API_KEY environment variable or ${ES_API_KEY})
+  api_key: ${ES_API_KEY}
+  # Index/data stream pattern for logs. If index_pattern is omitted, the app
+  # falls back to index_prefix + "*".
+  index_prefix: filebeat-
+  index_pattern: filebeat-*
+  # Query timeout in seconds
+  timeout_seconds: 30
+  # Set true only for local port-forwarding to self-signed ECK Elasticsearch.
+  tls_insecure_skip_verify: true
+
+kubernetes:
+  # Optional kube context to select before startup when using ./start.sh.
+  context: ${K8S_CONTEXT}
+  # Path to kubeconfig file (can be set via K8S_KUBECONFIG environment variable or ${K8S_KUBECONFIG})
+  kubeconfig: ${K8S_KUBECONFIG}
+  # Default namespace for Traefik resources
+  namespace: traefik
+  # Service account token (can be set via K8S_SERVICE_ACCOUNT_TOKEN environment variable or ${K8S_SERVICE_ACCOUNT_TOKEN})
+  service_account_token: ${K8S_SERVICE_ACCOUNT_TOKEN}
+  # API call timeout in seconds
+  timeout_seconds: 30
+
+database:
+  # Path to SQLite database file
+  path: data/devops-agent.db
+  # Connection pool size
+  pool_size: 5
+
+web:
+  # Host to bind the SPA web server
+  host: 127.0.0.1
+  # Port to bind the SPA web server
+  port: 8080
+  # Directory containing static SPA files
+  static_dir: src/web/static
+
+scheduler:
+  # Interval in seconds between threat detection runs
+  interval_seconds: 300
+  # Lookback window per detection run
+  lookback_minutes: 60
+  # Minimum 401/403 responses from one source IP before creating an incident
+  failure_threshold: 10
+  # Field names for the Traefik access-log mapping in the configured ES indices.
+  # Use ClientHost.keyword/RequestPath.keyword/etc. if your fields are text with
+  # keyword subfields instead of direct keyword fields.
+  time_field: "@timestamp"
+  status_field: DownstreamStatus
+  client_host_field: ClientHost
+  request_method_field: RequestMethod
+  request_path_field: RequestPath
+  request_host_field: RequestHost
+
+enforcement:
+  # Keep true to apply approved blocks. Set false for dry-run approvals only.
+  enabled: true
+  # Namespace and route used for the high-priority edge deny IngressRoute.
+  namespace: traefik
+  edge_ingressroute_name: edge-ip-deny
+  edge_deny_service_name: edge-deny
+  edge_deny_service_port: 80

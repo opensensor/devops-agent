@@ -1,0 +1,79 @@
+# Operating Mode: analyze or serve-spa
+mode: analyze
+
+# LLM Service Configuration
+llm:
+  provider: "ollama"
+  url: "http://127.0.0.1:11434"
+  api_key: "${LLM_API_KEY}"
+  model: "llama3.1"
+  temperature: 0.1
+
+# Abuse-report email delivery.
+# Set provider credentials in .env or the shell; do not commit live keys.
+email:
+  provider: "mailjet"
+  from_email: "abuse@example.com"
+  from_name: "DevOps Agent Abuse Reports"
+  sandbox_mode: false
+  mailjet:
+    api_key: "${MAILJET_API_KEY}"
+    api_secret: "${MAILJET_API_SECRET}"
+    endpoint: "https://api.mailjet.com/v3.1/send"
+  postmark:
+    server_token: "${POSTMARK_SERVER_TOKEN}"
+    endpoint: "https://api.postmarkapp.com/email"
+    message_stream: "outbound"
+
+# Elasticsearch/Kibana Configuration.
+# Credentials should come from environment variables, a local .env file, or
+# cluster secrets loaded by ./start.sh --es-tunnel. Never commit them here.
+elasticsearch:
+  url: "https://localhost:9200"
+  username: "${ES_USERNAME}"
+  password: "${ES_PASSWORD}"
+  api_key: "${ES_API_KEY}"
+  index_prefix: "filebeat-"
+  index_pattern: "filebeat-*"
+  timeout_seconds: 30
+  # The ECK-managed ES HTTP service uses a self-signed certificate. This is
+  # acceptable for local kubectl port-forwarding; do not enable it for public ES.
+  tls_insecure_skip_verify: true
+
+# Kubernetes Configuration
+kubernetes:
+  # Optional: set to a kube context name for profile-specific startup.
+  # context: "production-cluster"
+  namespace: "traefik"
+
+# Database Configuration
+database:
+  path: "data/devops-agent.db"
+  pool_size: 5
+
+# Web Server Configuration
+web:
+  host: "127.0.0.1"
+  port: 8081
+
+# Scheduler Configuration
+scheduler:
+  interval_seconds: 300      # how often a detection run fires
+  lookback_minutes: 60       # each run inspects the last hour of traffic
+  failure_threshold: 10      # minimum 401/403 responses from one IP before incident creation
+  time_field: "@timestamp"
+  status_field: "DownstreamStatus"
+  client_host_field: "ClientHost"
+  request_method_field: "RequestMethod"
+  request_path_field: "RequestPath"
+  request_host_field: "RequestHost"
+
+# Enforcement Configuration
+# Approving ("Block IP") updates the high-priority Traefik edge deny route.
+# Use ./start.sh --dry-run when you want approvals recorded without cluster changes.
+enforcement:
+  enabled: true
+  namespace: "traefik"
+  edge_ingressroute_name: "edge-ip-deny"
+  edge_deny_service_name: "edge-deny"
+  edge_deny_service_port: 80

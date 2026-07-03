@@ -1,0 +1,155 @@
+---
+# Service Account for DevOps Network Monitoring Agent
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: devops-agent-sa
+  namespace: default
+  labels:
+    app: devops-agent
+
+---
+# Role for Traefik CRD access in default namespace
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  namespace: default
+  name: devops-agent-traefik-crd-role
+  labels:
+    app: devops-agent
+rules:
+  # Permissions to inspect Middleware resources
+  - apiGroups:
+      - "traefik.io"
+    resources:
+      - middlewares
+    verbs:
+      - get
+      - list
+      - watch
+      - create
+      - update
+      - patch
+  - apiGroups:
+      - "traefik.containo.us"
+    resources:
+      - middlewares
+    verbs:
+      - get
+      - list
+      - watch
+      - create
+      - update
+      - patch
+  # Permissions to inspect IngressRoute resources
+  - apiGroups:
+      - "traefik.io"
+    resources:
+      - ingressroutes
+    verbs:
+      - get
+      - list
+      - watch
+      - update
+      - patch
+  - apiGroups:
+      - "traefik.containo.us"
+    resources:
+      - ingressroutes
+    verbs:
+      - get
+      - list
+      - watch
+      - update
+      - patch
+
+---
+# RoleBinding for default namespace
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: devops-agent-traefik-crd-rolebinding
+  namespace: default
+  labels:
+    app: devops-agent
+subjects:
+  - kind: ServiceAccount
+    name: devops-agent-sa
+    namespace: default
+roleRef:
+  kind: Role
+  name: devops-agent-traefik-crd-role
+  apiGroup: rbac.authorization.k8s.io
+
+---
+# Role for Traefik CRD access in traefik namespace
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  namespace: traefik
+  name: devops-agent-traefik-crd-role
+  labels:
+    app: devops-agent
+rules:
+  # Permissions to inspect Middleware resources
+  - apiGroups:
+      - "traefik.io"
+    resources:
+      - middlewares
+    verbs:
+      - get
+      - list
+      - watch
+      - create
+      - update
+      - patch
+  - apiGroups:
+      - "traefik.containo.us"
+    resources:
+      - middlewares
+    verbs:
+      - get
+      - list
+      - watch
+      - create
+      - update
+      - patch
+  # Permissions to inspect IngressRoute resources
+  - apiGroups:
+      - "traefik.io"
+    resources:
+      - ingressroutes
+    verbs:
+      - get
+      - list
+      - watch
+      - update
+      - patch
+  - apiGroups:
+      - "traefik.containo.us"
+    resources:
+      - ingressroutes
+    verbs:
+      - get
+      - list
+      - watch
+      - update
+      - patch
+
+---
+# RoleBinding for traefik namespace
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: devops-agent-traefik-crd-rolebinding
+  namespace: traefik
+  labels:
+    app: devops-agent
+subjects:
+  - kind: ServiceAccount
+    name: devops-agent-sa
+    namespace: default
+roleRef:
+  kind: Role
+  name: devops-agent-traefik-crd-role
+  apiGroup: rbac.authorization.k8s.io
