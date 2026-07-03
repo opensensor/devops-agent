@@ -87,6 +87,16 @@ pub struct RecommendationResponse {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+pub struct AiInspectResponse {
+    pub incident_id: String,
+    pub source_ip: String,
+    pub analysis: String,
+    pub evidence_count: usize,
+    pub tool_calls: serde_json::Value,
+    pub done: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct AbuseReportResponse {
     pub incident_id: String,
     pub source_ip: String,
@@ -103,6 +113,18 @@ pub struct AbuseReportResponse {
 struct SendAbuseReportRequest {
     #[serde(default)]
     force: bool,
+    #[serde(default)]
+    ai_inspection: Option<AiInspectionReportContext>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct AiInspectionReportContext {
+    #[serde(default)]
+    analysis: String,
+    #[serde(default)]
+    evidence_count: Option<usize>,
+    #[serde(default)]
+    done: Option<bool>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -166,6 +188,7 @@ pub struct AppState {
     pub whois_client: crate::whois::WhoisClient,
     pub email_client: crate::email::EmailClient,
     pub agent: Option<Arc<DevOpsAgent>>,
+    pub agent_error: Option<String>,
 }
 
 pub fn create_router(state: AppState) -> Router {
@@ -173,6 +196,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/health", get(health_check))
         .route("/incidents", get(get_incidents))
         .route("/incidents/:id/recommendation", get(get_recommendation))
+        .route("/incidents/:id/ai-inspect", post(ai_inspect_incident))
         .route("/incidents/:id/whois", get(get_incident_whois))
         .route("/incidents/:id/report-abuse", post(send_abuse_report))
         .route("/incidents/:id/approve", post(approve_incident))
@@ -838,6 +862,99 @@ async fn get_recommendation(
     }
 }
 
+async fn ai_inspect_incident(
+    State(state): State<AppState>,
+    Path(incident_id): Path<String>,
+) -> impl IntoResponse {
+    let Some(agent) = state.agent.as_ref().map(|agent| (**agent).clone()) else {
+        let message = state.agent_error.as_deref().map_or_else(
+            || "AI inspection is unavailable because no LLM provider is configured".to_string(),
+            |error| format!("AI inspection is unavailable: {}", error),
+        );
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ApiResponse::<AiInspectResponse> {
+                success: false,
+                data: None,
+                message: Some(message),
+            }),
+        );
+    };
+
+    let incident = match crate::db::queries::get_incident(&state.db_pool, &incident_id).await {
+        Ok(Some(incident)) => incident,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(ApiResponse::<AiInspectResponse> {
+                    success: false,
+                    data: None,
+                    message: Some("Incident not found".to_string()),
+                }),
+            );
+        }
+        Err(e) => {
+            tracing::error!("Failed to get incident for AI inspection: {}", e);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiResponse::<AiInspectResponse> {
+                    success: false,
+                    data: None,
+                    message: Some(format!("Failed to get incident: {}", e)),
+                }),
+            );
+        }
+    };
+
+    let (log_evidence, evidence_note) =
+        match fetch_abuse_report_log_evidence(&state, &incident).await {
+            Ok(events) => (events, None),
+            Err(e) => {
+                tracing::warn!(
+                    "Could not fetch raw log evidence for AI inspection {}: {}",
+                    incident.source_ip,
+                    e
+                );
+                (Vec::new(), Some(e.to_string()))
+            }
+        };
+
+    let prompt = build_ai_inspection_prompt(
+        &incident,
+        &state.evidence_index_pattern,
+        &state.scheduler_config,
+        &log_evidence,
+        evidence_note.as_deref(),
+    );
+    let task = Task::new(prompt);
+    let context = Arc::new(Context::new(agent.llm().clone(), None));
+    let react_agent = ReActAgent::with_max_turns(agent, 8);
+
+    match react_agent.execute(&task, context).await {
+        Ok(output) => {
+            let tool_calls =
+                serde_json::to_value(&output.tool_calls).unwrap_or_else(|_| serde_json::json!([]));
+            let response = AiInspectResponse {
+                incident_id: incident.id,
+                source_ip: incident.source_ip,
+                analysis: output.response,
+                evidence_count: log_evidence.len(),
+                tool_calls,
+                done: output.done,
+            };
+            (StatusCode::OK, Json(ApiResponse::new(response)))
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiResponse::<AiInspectResponse> {
+                success: false,
+                data: None,
+                message: Some(format!("AI inspection failed: {}", e)),
+            }),
+        ),
+    }
+}
+
 async fn get_incident_whois(
     State(state): State<AppState>,
     Path(incident_id): Path<String>,
@@ -1049,6 +1166,7 @@ async fn send_abuse_report(
         recipients.clone(),
         &sender_name,
         &log_evidence,
+        request.ai_inspection.as_ref(),
     );
     match state.email_client.send_abuse_report(&report).await {
         Ok(result) => {
@@ -1343,6 +1461,7 @@ fn build_abuse_report_email(
     recipients: Vec<String>,
     sender_name: &str,
     log_evidence: &[LogEvidenceEvent],
+    ai_inspection: Option<&AiInspectionReportContext>,
 ) -> crate::email::AbuseReportEmail {
     let details: Option<serde_json::Value> = incident
         .details
@@ -1359,6 +1478,8 @@ fn build_abuse_report_email(
     let path_lines = detail_pair_text(details.as_ref(), "top_paths", "Top requested paths");
     let raw_log_lines = raw_log_evidence_text(log_evidence);
     let raw_log_html = raw_log_evidence_html(log_evidence);
+    let ai_inspection_text = ai_inspection_report_text(ai_inspection);
+    let ai_inspection_html = ai_inspection_report_html(ai_inspection);
     let sender_name = sender_name.trim();
     let sender_name = if sender_name.is_empty() {
         "DevOps Agent"
@@ -1382,6 +1503,7 @@ Country: {country}\n\
 Address range: {range}\n\
 RDAP source: {source}\n\n\
 Evidence summary:\n{status_lines}{method_lines}{host_lines}{path_lines}\n\
+{ai_inspection_text}\
 Raw log sample:\n{raw_log_lines}\n\
 Please investigate this source and take appropriate action.\n\n\
 Regards,\n{sender_name}\n",
@@ -1399,6 +1521,7 @@ Regards,\n{sender_name}\n",
         method_lines = method_lines,
         host_lines = host_lines,
         path_lines = path_lines,
+        ai_inspection_text = ai_inspection_text,
         raw_log_lines = raw_log_lines,
     );
 
@@ -1415,6 +1538,7 @@ Regards,\n{sender_name}\n",
 <tr><th align=\"left\">RDAP source</th><td>{source}</td></tr>\
 </table>\
 <h3>Evidence summary</h3>{status_html}{method_html}{host_html}{path_html}\
+{ai_inspection_html}\
 <h3>Raw log sample</h3>{raw_log_html}\
 <p>Please investigate this source and take appropriate action.</p>\
 <p>Regards,<br>{sender_name}</p>",
@@ -1432,6 +1556,7 @@ Regards,\n{sender_name}\n",
         method_html = detail_pair_html(details.as_ref(), "methods", "Methods"),
         host_html = detail_pair_html(details.as_ref(), "target_hosts", "Targeted hosts"),
         path_html = detail_pair_html(details.as_ref(), "top_paths", "Top requested paths"),
+        ai_inspection_html = ai_inspection_html,
         raw_log_html = raw_log_html,
     );
 
@@ -1442,6 +1567,80 @@ Regards,\n{sender_name}\n",
         html_body,
         custom_id: Some(incident.id.clone()),
     }
+}
+
+fn ai_inspection_report_text(ai_inspection: Option<&AiInspectionReportContext>) -> String {
+    let Some(ai_inspection) = ai_inspection else {
+        return String::new();
+    };
+    let analysis = compact_multiline_value(&ai_inspection.analysis, 6000);
+    if analysis.trim().is_empty() {
+        return String::new();
+    }
+
+    let evidence_count = ai_inspection
+        .evidence_count
+        .map(|count| count.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    let completion = match ai_inspection.done {
+        Some(true) => "complete",
+        Some(false) => "partial",
+        None => "unknown",
+    };
+
+    format!(
+        "AI inspection:\n- Evidence events reviewed: {}\n- Result status: {}\n{}\n\n",
+        evidence_count, completion, analysis
+    )
+}
+
+fn ai_inspection_report_html(ai_inspection: Option<&AiInspectionReportContext>) -> String {
+    let Some(ai_inspection) = ai_inspection else {
+        return String::new();
+    };
+    let analysis = compact_multiline_value(&ai_inspection.analysis, 6000);
+    if analysis.trim().is_empty() {
+        return String::new();
+    }
+
+    let evidence_count = ai_inspection
+        .evidence_count
+        .map(|count| count.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    let completion = match ai_inspection.done {
+        Some(true) => "complete",
+        Some(false) => "partial",
+        None => "unknown",
+    };
+
+    format!(
+        "<h3>AI inspection</h3>\
+<table>\
+<tr><th align=\"left\">Evidence events reviewed</th><td>{}</td></tr>\
+<tr><th align=\"left\">Result status</th><td>{}</td></tr>\
+</table>\
+<pre>{}</pre>",
+        html_escape(&evidence_count),
+        html_escape(completion),
+        html_escape(&analysis)
+    )
+}
+
+fn compact_multiline_value(value: &str, max_chars: usize) -> String {
+    let normalized = value
+        .replace('\r', "\n")
+        .replace('\t', " ")
+        .lines()
+        .map(str::trim_end)
+        .collect::<Vec<_>>()
+        .join("\n");
+    if normalized.chars().count() <= max_chars {
+        return normalized;
+    }
+
+    let mut truncated = normalized.chars().take(max_chars).collect::<String>();
+    truncated.push_str("...");
+    truncated
 }
 
 fn detail_pair_text(details: Option<&serde_json::Value>, key: &str, label: &str) -> String {
@@ -1556,6 +1755,65 @@ fn raw_log_evidence_html(events: &[LogEvidenceEvent]) -> String {
 {}\
 </table>",
         rows
+    )
+}
+
+fn build_ai_inspection_prompt(
+    incident: &crate::db::queries::IncidentDb,
+    index_pattern: &str,
+    cfg: &crate::config::models::SchedulerConfig,
+    log_evidence: &[LogEvidenceEvent],
+    evidence_error: Option<&str>,
+) -> String {
+    let details: Option<serde_json::Value> = incident
+        .details
+        .as_deref()
+        .and_then(|d| serde_json::from_str(d).ok());
+    let details_json = details
+        .as_ref()
+        .and_then(|details| serde_json::to_string_pretty(details).ok())
+        .map(|details| compact_log_value(&details, 5000))
+        .unwrap_or_else(|| "No structured detection details were recorded.".to_string());
+    let evidence = compact_log_value(&raw_log_evidence_text(log_evidence), 7000);
+    let evidence_note = evidence_error
+        .map(|error| format!("Evidence fetch warning: {}\n", error))
+        .unwrap_or_default();
+
+    format!(
+        "You are assisting a security operator reviewing a suspicious edge-traffic incident.\n\
+Analyze the incident and available Elasticsearch log evidence. You may use the query_logs tool for read-only follow-up queries if the provided sample is not enough.\n\
+Do not recommend irreversible actions without evidence. Keep the response concise and use these sections exactly: Assessment, Evidence, Recommended Action, Reporting Notes, Unknowns.\n\n\
+Incident:\n\
+- id: {incident_id}\n\
+- source_ip: {source_ip}\n\
+- detected_at: {detected_at}\n\
+- status: {status}\n\
+- failure_count: {failure_count}\n\n\
+Elasticsearch context:\n\
+- index_pattern: {index_pattern}\n\
+- time_field: {time_field}\n\
+- status_field: {status_field}\n\
+- client_host_field: {client_host_field}\n\
+- request_method_field: {request_method_field}\n\
+- request_host_field: {request_host_field}\n\
+- request_path_field: {request_path_field}\n\n\
+Structured detection details:\n{details_json}\n\n\
+{evidence_note}Raw log sample:\n{evidence}",
+        incident_id = incident.id,
+        source_ip = incident.source_ip,
+        detected_at = incident.detected_at,
+        status = incident.status,
+        failure_count = incident.failure_count,
+        index_pattern = index_pattern,
+        time_field = cfg.time_field,
+        status_field = cfg.status_field,
+        client_host_field = cfg.client_host_field,
+        request_method_field = cfg.request_method_field,
+        request_host_field = cfg.request_host_field,
+        request_path_field = cfg.request_path_field,
+        details_json = details_json,
+        evidence_note = evidence_note,
+        evidence = evidence,
     )
 }
 
@@ -1862,14 +2120,16 @@ async fn agent_chat(
     Json(request): Json<AgentChatRequest>,
 ) -> impl IntoResponse {
     let Some(agent) = state.agent.as_ref().map(|agent| (**agent).clone()) else {
+        let message = state.agent_error.as_deref().map_or_else(
+            || "Agent chat is unavailable because no LLM provider is configured".to_string(),
+            |error| format!("Agent chat is unavailable: {}", error),
+        );
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(ApiResponse::<serde_json::Value> {
                 success: false,
                 data: None,
-                message: Some(
-                    "Agent chat is unavailable because no LLM provider is configured".to_string(),
-                ),
+                message: Some(message),
             }),
         );
     };
@@ -2098,5 +2358,72 @@ mod tests {
 
         assert!(bytes.starts_with(b"PK"));
         assert!(bytes.len() > 1024);
+    }
+
+    #[test]
+    fn abuse_report_email_includes_ai_inspection_and_raw_logs() {
+        let incident = crate::db::queries::IncidentDb {
+            id: "incident-203.0.113.10".to_string(),
+            source_ip: "203.0.113.10".to_string(),
+            detected_at: "2026-07-03T12:00:00Z".to_string(),
+            status: "detected".to_string(),
+            failure_count: 42,
+            details: Some(
+                serde_json::json!({
+                    "window_minutes": 60,
+                    "status_breakdown": [["401", 42]],
+                    "methods": [["GET", 42]],
+                    "target_hosts": [["example.com", 42]],
+                    "top_paths": [["/.env", 12]]
+                })
+                .to_string(),
+            ),
+            created_at: "2026-07-03T12:00:00Z".to_string(),
+            updated_at: "2026-07-03T12:00:00Z".to_string(),
+        };
+        let whois = crate::whois::WhoisInfo {
+            ip: "203.0.113.10".to_string(),
+            registry_url: Some("https://rdap.example/ip/203.0.113.10".to_string()),
+            network_name: Some("Example Net".to_string()),
+            handle: None,
+            country: Some("US".to_string()),
+            start_address: Some("203.0.113.0".to_string()),
+            end_address: Some("203.0.113.255".to_string()),
+            organization: Some("Example Org".to_string()),
+            abuse_contacts: Vec::new(),
+        };
+        let logs = vec![LogEvidenceEvent {
+            timestamp: "2026-07-03T11:59:00Z".to_string(),
+            source_ip: "203.0.113.10".to_string(),
+            status: "401".to_string(),
+            method: "GET".to_string(),
+            host: "example.com".to_string(),
+            path: "/.env".to_string(),
+            user_agent: Some("scanner".to_string()),
+            index: "filebeat-2026.07.03".to_string(),
+        }];
+        let ai_inspection = AiInspectionReportContext {
+            analysis: "Assessment: credential probing.\nRecommended Action: block and report."
+                .to_string(),
+            evidence_count: Some(1),
+            done: Some(true),
+        };
+
+        let email = build_abuse_report_email(
+            &incident,
+            &whois,
+            vec!["abuse@example.net".to_string()],
+            "DevOps Agent Abuse Reports",
+            &logs,
+            Some(&ai_inspection),
+        );
+
+        assert!(email.text_body.contains("AI inspection:"));
+        assert!(email.text_body.contains("credential probing"));
+        assert!(email.text_body.contains("Raw log sample:"));
+        assert!(email.text_body.contains("path=/.env"));
+        assert!(email.html_body.contains("<h3>AI inspection</h3>"));
+        assert!(email.html_body.contains("credential probing"));
+        assert!(email.html_body.contains("<h3>Raw log sample</h3>"));
     }
 }

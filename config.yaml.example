@@ -4,7 +4,7 @@
 # or by setting environment variables directly:
 #   - ES_USERNAME, ES_PASSWORD, ES_API_KEY for Elasticsearch
 #   - K8S_KUBECONFIG, K8S_SERVICE_ACCOUNT_TOKEN for Kubernetes
-#   - LLM_API_KEY for LLM providers
+#   - LLM_API_KEY, LLM_MODEL for LLM providers
 #   - MAILJET_API_KEY, MAILJET_API_SECRET for Mailjet abuse-report delivery
 #   - POSTMARK_SERVER_TOKEN for Postmark abuse-report delivery
 
@@ -14,12 +14,12 @@ llm:
   # Provider type: ollama, openai, anthropic, deepseek, groq, or openrouter.
   # For OpenAI-compatible local servers, use provider: openai and set url to the
   # base /v1 URL, not /v1/chat/completions.
-  provider: ollama
-  url: http://localhost:11434
+  provider: openai
+  url: http://127.0.0.1:8080/v1
   # API key for hosted providers. Local OpenAI-compatible servers usually accept
   # any non-empty value, for example "local".
-  api_key: ${LLM_API_KEY}
-  model: llama3.1
+  api_key: local
+  model: local-model
   temperature: 0.1
 
 email:

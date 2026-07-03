@@ -1,6 +1,7 @@
 let currentIncidents = [];
 let allIncidents = [];
 let activeAbuseReportIncident = null;
+const aiInspectionResults = new Map();
 const incidentFilters = {
     status: 'all',
     block: 'all',
@@ -236,7 +237,7 @@ function renderIncidents(incidents, totalCount = incidents.length) {
                         ` : ''}
                         <button class="btn-whois" onclick="getWhois('${incident.id}')" title="Look up network ownership and abuse contacts">WHOIS</button>
                         <button class="btn-report" onclick="openAbuseReportModal('${incident.id}')" title="Send an abuse report through the configured email provider to RDAP abuse contacts">Report Abuse</button>
-                        <button class="btn-recommendation" onclick="getRecommendation('${incident.id}')">Recommendation</button>
+                        <button class="btn-recommendation" onclick="getRecommendation('${incident.id}')" title="Open the incident recommendation">Recommendation</button>
                     </div>
                 </div>
                 ${renderMetrics(incident)}
@@ -470,6 +471,7 @@ function ensureAbuseReportModal() {
             <div class="modal-body">
                 <div id="abuse-report-summary" class="modal-summary"></div>
                 <div id="abuse-report-prior" class="modal-warning" style="display: none;"></div>
+                <div id="abuse-report-ai-context" class="modal-info" style="display: none;"></div>
                 <div class="modal-section">
                     <div class="modal-section-label">Recipients</div>
                     <div id="abuse-report-recipients" class="modal-recipients">Loading abuse contacts...</div>
@@ -514,6 +516,16 @@ function openAbuseReportModal(incidentId) {
     modal.querySelector('#abuse-report-title').textContent = alreadySent ? 'Abuse Report Sent' : 'Send Abuse Report';
     modal.querySelector('#abuse-report-subtitle').textContent = `${incident.source_ip} via configured email provider`;
     modal.querySelector('#abuse-report-summary').innerHTML = renderAbuseReportSummary(incident);
+
+    const aiContext = modal.querySelector('#abuse-report-ai-context');
+    const aiInspection = aiInspectionResults.get(incidentId);
+    if (aiInspection && aiInspection.analysis) {
+        aiContext.style.display = 'block';
+        aiContext.textContent = `AI inspection will be included with the system log evidence (${Number(aiInspection.evidence_count || 0)} sampled events).`;
+    } else {
+        aiContext.style.display = 'none';
+        aiContext.textContent = '';
+    }
 
     const prior = modal.querySelector('#abuse-report-prior');
     if (alreadySent) {
@@ -610,7 +622,10 @@ async function sendAbuseReport(incidentId, force) {
             headers: {
                 'Content-Type': 'application/json'
             },
-            body: JSON.stringify({ force: Boolean(force) })
+            body: JSON.stringify({
+                force: Boolean(force),
+                ai_inspection: aiInspectionReportPayload(incidentId)
+            })
         });
         const data = await response.json();
 
@@ -709,24 +724,125 @@ async function rejectIncident(incidentId) {
 async function getRecommendation(incidentId) {
     const recDiv = document.getElementById(`recommendation-${incidentId}`);
     recDiv.style.display = 'block';
-    recDiv.innerHTML = '<p class="loading">Loading recommendation...</p>';
+    recDiv.innerHTML = '<p class="loading compact-loading">Loading recommendation...</p>';
 
     try {
         const response = await fetch(`/api/incidents/${incidentId}/recommendation`);
         const data = await response.json();
 
         if (data.success && data.data) {
-            recDiv.innerHTML = `
-                <h4>Recommendation</h4>
-                <p><strong>Action Type:</strong> ${escapeHtml(data.data.action_type)}</p>
-                <p><strong>Details:</strong> ${escapeHtml(data.data.recommendation)}</p>
-            `;
+            recDiv.innerHTML = renderRecommendationCard(incidentId, data.data);
         } else {
             recDiv.innerHTML = `<p class="message-error">${data.message || 'Failed to get recommendation'}</p>`;
         }
     } catch (error) {
         recDiv.innerHTML = '<p class="message-error">Error loading recommendation</p>';
     }
+}
+
+function renderRecommendationCard(incidentId, recommendation) {
+    const actionType = recommendation.action_type || 'review';
+    const badgeClass = actionType === 'block' ? 'recommendation-badge-block' : 'recommendation-badge-review';
+    const title = actionType === 'block' ? 'Block recommended' : 'Operator review recommended';
+
+    return `
+        <div class="recommendation-header">
+            <div>
+                <div class="recommendation-eyebrow">Recommendation</div>
+                <h4>${escapeHtml(title)}</h4>
+            </div>
+            <span class="recommendation-badge ${badgeClass}">${escapeHtml(actionType)}</span>
+        </div>
+        <p class="recommendation-copy">${escapeHtml(recommendation.recommendation || 'No recommendation returned.')}</p>
+        <div class="recommendation-actions">
+            <button class="btn-ai-inspect" onclick="aiInspectIncident('${incidentId}', this)" title="Run AI inspection against recent log evidence">AI Inspect Logs</button>
+        </div>
+        <div id="ai-inspect-${incidentId}" class="ai-inspect-panel" style="display: none;"></div>
+    `;
+}
+
+async function aiInspectIncident(incidentId, button) {
+    const panel = document.getElementById(`ai-inspect-${incidentId}`);
+    if (!panel) return;
+
+    panel.style.display = 'block';
+    panel.innerHTML = '<p class="loading compact-loading">Inspecting recent log evidence...</p>';
+    if (button) button.disabled = true;
+
+    try {
+        const response = await fetch(`/api/incidents/${incidentId}/ai-inspect`, {
+            method: 'POST'
+        });
+        const data = await response.json();
+
+        if (data.success && data.data) {
+            aiInspectionResults.set(incidentId, data.data);
+            panel.innerHTML = renderAiInspectResult(data.data);
+        } else {
+            panel.innerHTML = `<p class="message-error compact">${escapeHtml(data.message || 'AI inspection failed')}</p>`;
+        }
+    } catch (error) {
+        panel.innerHTML = '<p class="message-error compact">Error running AI inspection</p>';
+    } finally {
+        if (button) button.disabled = false;
+    }
+}
+
+function renderAiInspectResult(result) {
+    const analysis = typeof result.analysis === 'string'
+        ? result.analysis
+        : JSON.stringify(result.analysis || '', null, 2);
+    const toolCalls = Array.isArray(result.tool_calls) ? result.tool_calls : [];
+    const toolCallDetails = toolCalls.length
+        ? `
+            <details class="ai-tool-calls">
+                <summary>Tool calls (${toolCalls.length})</summary>
+                <pre>${escapeHtml(JSON.stringify(toolCalls, null, 2))}</pre>
+            </details>
+        `
+        : '';
+
+    return `
+        <div class="ai-inspect-meta">
+            <span>${Number(result.evidence_count || 0)} evidence events</span>
+            <span>${result.done ? 'Complete' : 'Partial'}</span>
+            <span>Report-ready</span>
+        </div>
+        <pre class="ai-inspect-text">${escapeHtml(analysis || 'No analysis returned.')}</pre>
+        ${renderAiFollowupActions(result.incident_id)}
+        ${toolCallDetails}
+    `;
+}
+
+function renderAiFollowupActions(incidentId) {
+    if (!incidentId) return '';
+    const incident = findIncidentById(incidentId);
+    let blockAction = '';
+
+    if (incident && incident.status === 'detected') {
+        blockAction = `<button class="btn-block-report" onclick="blockAndReportIncident('${incidentId}')" title="Block this IP and open the report modal with AI context included">Block + Report</button>`;
+    } else if (incident && incident.status === 'approved' && !incident.block_applied) {
+        blockAction = `<button class="btn-block-report" onclick="applyBlockAndReport('${incidentId}')" title="Apply the block and open the report modal with AI context included">Apply + Report</button>`;
+    }
+
+    return `
+        <div class="ai-followup-actions">
+            <button class="btn-whois" onclick="getWhois('${incidentId}')" title="Look up network ownership and abuse contacts">WHOIS</button>
+            ${blockAction}
+            <button class="btn-report" onclick="openAbuseReportModal('${incidentId}')" title="Send abuse report with AI analysis and system logs">Report with AI</button>
+        </div>
+    `;
+}
+
+function aiInspectionReportPayload(incidentId) {
+    const result = aiInspectionResults.get(incidentId);
+    if (!result || !result.analysis) return null;
+
+    return {
+        analysis: String(result.analysis),
+        evidence_count: Number(result.evidence_count || 0),
+        done: Boolean(result.done)
+    };
 }
 
 async function loadAllowlist() {
@@ -863,5 +979,6 @@ window.openAbuseReportModal = openAbuseReportModal;
 window.sendAbuseReport = sendAbuseReport;
 window.rejectIncident = rejectIncident;
 window.getRecommendation = getRecommendation;
+window.aiInspectIncident = aiInspectIncident;
 window.addAllowlistIp = addAllowlistIp;
 window.removeAllowlistIp = removeAllowlistIp;

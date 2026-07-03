@@ -17,6 +17,7 @@ KILL_EXISTING="${KILL_EXISTING:-0}"
 LLM_PROVIDER="${LLM_PROVIDER:-}"
 LLM_URL="${LLM_URL:-}"
 LLM_API_KEY="${LLM_API_KEY:-}"
+LLM_MODEL="${LLM_MODEL:-}"
 EMAIL_PROVIDER="${EMAIL_PROVIDER:-}"
 EMAIL_FROM_EMAIL="${EMAIL_FROM_EMAIL:-}"
 EMAIL_FROM_NAME="${EMAIL_FROM_NAME:-}"
@@ -58,6 +59,7 @@ Common options:
   --llm-provider PROVIDER       ollama, openai, anthropic, deepseek, groq, openrouter
   --llm-url URL                 LLM base URL, for example http://127.0.0.1:8080/v1
   --llm-api-key KEY             LLM API key; local OpenAI-compatible servers often accept "local"
+  --llm-model MODEL             LLM model name (default: config value)
   --email-provider PROVIDER     Abuse-report provider: mailjet or postmark
   --email-from-email EMAIL      Abuse-report sender email (default: config value)
   --email-from-name NAME        Abuse-report sender display name (default: config value)
@@ -86,7 +88,7 @@ Common options:
 
 Environment overrides:
   CONFIG, PROFILE, MODE, SERVE_SPA, RELEASE, NO_BUILD, BIN, RUST_LOG, KILL_EXISTING
-  LLM_PROVIDER, LLM_URL, LLM_API_KEY, ENFORCEMENT_MODE
+  LLM_PROVIDER, LLM_URL, LLM_API_KEY, LLM_MODEL, ENFORCEMENT_MODE
   ES_USERNAME, ES_PASSWORD, ES_API_KEY
   EMAIL_PROVIDER, EMAIL_FROM_EMAIL, EMAIL_FROM_NAME, EMAIL_SANDBOX_MODE
   MAILJET_API_KEY, MAILJET_API_SECRET, MAILJET_FROM_EMAIL, MAILJET_FROM_NAME
@@ -104,7 +106,7 @@ Examples:
   ./start.sh --serve --es-tunnel --dry-run
   ./start.sh --analyze --es-tunnel
   ./start.sh --analyze --rust-log devops_agent=debug,tower_http=info
-  ./start.sh --serve --llm-provider openai --llm-url http://127.0.0.1:8080/v1 --llm-api-key local
+  ./start.sh --serve --llm-provider openai --llm-url http://127.0.0.1:8080/v1 --llm-api-key local --llm-model local-model
   ./start.sh --release --serve
 EOF
 }
@@ -510,6 +512,10 @@ while [[ $# -gt 0 ]]; do
       LLM_API_KEY="${2:?missing value for $1}"
       shift 2
       ;;
+    --llm-model)
+      LLM_MODEL="${2:?missing value for $1}"
+      shift 2
+      ;;
     --email-provider)
       EMAIL_PROVIDER="${2:?missing value for $1}"
       shift 2
@@ -642,6 +648,7 @@ fi
 [[ -n "$LLM_PROVIDER" ]] && app_args+=(--llm-provider "$LLM_PROVIDER")
 [[ -n "$LLM_URL" ]] && app_args+=(--llm-url "$LLM_URL")
 [[ -n "$LLM_API_KEY" ]] && app_args+=(--llm-api-key "$LLM_API_KEY")
+[[ -n "$LLM_MODEL" ]] && app_args+=(--llm-model "$LLM_MODEL")
 case "$ENFORCEMENT_MODE" in
   enforce)
     app_args+=(--enforce)

@@ -129,10 +129,10 @@ pub struct LlmConfig {
 impl Default for LlmConfig {
     fn default() -> Self {
         Self {
-            provider: "ollama".to_string(),
-            url: "http://127.0.0.1:11434".to_string(),
-            api_key: None,
-            model: "llama3.1".to_string(),
+            provider: "openai".to_string(),
+            url: "http://127.0.0.1:8080/v1".to_string(),
+            api_key: Some("local".to_string()),
+            model: "local-model".to_string(),
             temperature: 0.1,
         }
     }

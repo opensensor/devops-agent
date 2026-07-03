@@ -34,6 +34,10 @@ pub struct CliArgs {
     #[arg(long, value_name = "KEY")]
     pub llm_api_key: Option<String>,
 
+    /// LLM model name
+    #[arg(long, value_name = "MODEL")]
+    pub llm_model: Option<String>,
+
     /// Apply approved blocks to the cluster
     #[arg(long, conflicts_with = "dry_run")]
     pub enforce: bool,
@@ -120,6 +124,10 @@ pub fn load_config(cli_args: &CliArgs) -> Result<Config, String> {
         config.llm.api_key = Some(llm_api_key.clone());
     }
 
+    if let Some(llm_model) = &cli_args.llm_model {
+        config.llm.model = llm_model.clone();
+    }
+
     if cli_args.enforce {
         config.enforcement.enabled = true;
     }
@@ -157,6 +165,10 @@ pub fn load_config(cli_args: &CliArgs) -> Result<Config, String> {
     // Override LLM API key with environment variable if set
     if let Ok(llm_api_key) = env::var("LLM_API_KEY") {
         config.llm.api_key = Some(llm_api_key);
+    }
+
+    if let Ok(llm_model) = env::var("LLM_MODEL") {
+        config.llm.model = llm_model;
     }
 
     // Override email settings with environment variables if set. Mailjet env

@@ -30,7 +30,7 @@ $EDITOR .env config/local.yaml
 
 Open the SPA URL printed by the startup script. Use `--dry-run` to record approvals without changing the cluster, or `--enforce` to force live block application when the config disables it.
 
-For a local OpenAI-compatible LLM:
+The default config expects a local OpenAI-compatible LLM on `http://127.0.0.1:8080/v1`. To make that explicit or override another profile:
 
 ```bash
 ./start.sh \
@@ -49,7 +49,7 @@ For a local OpenAI-compatible LLM:
 Common environment variables:
 
 - `ES_USERNAME`, `ES_PASSWORD`, `ES_API_KEY`
-- `LLM_API_KEY`
+- `LLM_API_KEY`, `LLM_MODEL`
 - `MAILJET_API_KEY`, `MAILJET_API_SECRET`
 - `POSTMARK_SERVER_TOKEN`
 - `K8S_CONTEXT`, `K8S_KUBECONFIG`, `K8S_SERVICE_ACCOUNT_TOKEN`

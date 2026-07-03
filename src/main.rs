@@ -189,20 +189,29 @@ async fn main() {
                     }
                     let k8s_for_agent = k8s_client.clone();
 
-                    let agent = match config.llm.create_provider() {
-                        Ok(llm) => Some(Arc::new(build_agent(
-                            &db.pool,
-                            es_client_for_agent,
-                            k8s_for_agent,
-                            config.enforcement.namespace.clone(),
-                            llm,
-                        ))),
+                    let (agent, agent_error) = match config.llm.create_provider() {
+                        Ok(llm) => (
+                            Some(Arc::new(build_agent(
+                                &db.pool,
+                                es_client_for_agent,
+                                k8s_for_agent,
+                                config.enforcement.namespace.clone(),
+                                llm,
+                            ))),
+                            None,
+                        ),
                         Err(e) => {
                             tracing::warn!(
-                                "LLM provider is not available; /api/agent/chat will return 503: {}",
+                                "LLM provider is not available; AI inspection and /api/agent/chat will return 503: {}",
                                 e
                             );
-                            None
+                            (
+                                None,
+                                Some(format!(
+                                    "{}. Check llm.provider, llm.url, llm.api_key, or LLM_API_KEY.",
+                                    e
+                                )),
+                            )
                         }
                     };
 
@@ -220,6 +229,7 @@ async fn main() {
                         whois_client: whois::WhoisClient::new(),
                         email_client: email::EmailClient::new(config.email.clone()),
                         agent,
+                        agent_error,
                     };
 
                     tracing::info!(

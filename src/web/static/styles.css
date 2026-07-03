@@ -389,13 +389,18 @@ nav {
     color: #888;
 }
 
-.btn-approve, .btn-apply, .btn-block-report, .btn-whois, .btn-report, .btn-reject {
+.btn-approve, .btn-apply, .btn-block-report, .btn-whois, .btn-report, .btn-reject, .btn-recommendation, .btn-ai-inspect {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
     padding: 6px 12px;
     border: none;
     border-radius: 4px;
     cursor: pointer;
     font-size: 13px;
-    transition: opacity 0.2s;
+    font-weight: 650;
+    line-height: 1.2;
+    transition: background-color 0.2s, border-color 0.2s, color 0.2s, opacity 0.2s;
 }
 
 .btn-approve {
@@ -443,6 +448,29 @@ nav {
     opacity: 0.9;
 }
 
+.btn-recommendation {
+    border: 1px solid #b7c5d8;
+    background-color: #f8fafc;
+    color: #24364b;
+}
+
+.btn-recommendation:hover {
+    border-color: #64748b;
+    background-color: #eef2f7;
+}
+
+.btn-ai-inspect {
+    min-height: 34px;
+    border: 1px solid #0f766e;
+    background-color: #0f766e;
+    color: white;
+}
+
+.btn-ai-inspect:hover {
+    background-color: #115e59;
+    border-color: #115e59;
+}
+
 .btn-reject {
     background-color: #dc3545;
     color: white;
@@ -482,7 +510,8 @@ nav {
 }
 
 .btn-report:disabled,
-.btn-secondary:disabled {
+.btn-secondary:disabled,
+.btn-ai-inspect:disabled {
     cursor: not-allowed;
     opacity: 0.6;
 }
@@ -642,6 +671,16 @@ nav {
     font-size: 0.9rem;
 }
 
+.modal-info {
+    margin-top: 12px;
+    padding: 10px 12px;
+    border: 1px solid #b9ded8;
+    border-radius: 6px;
+    background-color: #f0fbf9;
+    color: #115e59;
+    font-size: 0.9rem;
+}
+
 .modal-section {
     margin-top: 14px;
 }
@@ -794,18 +833,146 @@ nav {
 }
 
 .recommendation {
-    background-color: #e7f3ff;
-    border: 1px solid #b3d9ff;
-    padding: 15px;
-    border-radius: 4px;
-    margin-top: 10px;
+    margin-top: 12px;
+    padding: 14px;
+    border: 1px solid #d8dee8;
+    border-left: 4px solid #0f766e;
+    border-radius: 6px;
+    background-color: #fbfcfe;
+    box-shadow: 0 1px 2px rgba(15, 23, 42, 0.06);
+}
+
+.recommendation-header {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 12px;
+    margin-bottom: 10px;
+}
+
+.recommendation-eyebrow {
+    margin-bottom: 2px;
+    color: #64748b;
+    font-size: 0.72rem;
+    font-weight: 800;
+    text-transform: uppercase;
 }
 
 .recommendation h4 {
-    margin-bottom: 8px;
-    color: #0056b3;
+    margin: 0;
+    color: #172033;
+    font-size: 1rem;
+    line-height: 1.25;
 }
 
-.recommendation p {
-    color: #333;
+.recommendation-badge {
+    display: inline-flex;
+    align-items: center;
+    min-height: 24px;
+    padding: 3px 9px;
+    border-radius: 999px;
+    font-size: 0.72rem;
+    font-weight: 800;
+    text-transform: uppercase;
+    white-space: nowrap;
+}
+
+.recommendation-badge-block {
+    background-color: #fee2e2;
+    color: #991b1b;
+}
+
+.recommendation-badge-review {
+    background-color: #fef3c7;
+    color: #92400e;
+}
+
+.recommendation-copy {
+    margin: 0;
+    color: #2d3748;
+    font-size: 0.92rem;
+}
+
+.recommendation-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-top: 12px;
+}
+
+.compact-loading {
+    padding: 8px 0;
+    text-align: left;
+}
+
+.ai-inspect-panel {
+    margin-top: 12px;
+    padding: 12px;
+    border: 1px solid #d6e3e1;
+    border-radius: 6px;
+    background-color: #f7fbfa;
+}
+
+.ai-inspect-meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-bottom: 10px;
+}
+
+.ai-inspect-meta span {
+    display: inline-flex;
+    align-items: center;
+    min-height: 22px;
+    padding: 2px 8px;
+    border-radius: 999px;
+    background-color: #e6f3f1;
+    color: #115e59;
+    font-size: 0.75rem;
+    font-weight: 750;
+}
+
+.ai-inspect-text {
+    max-height: 360px;
+    overflow: auto;
+    margin: 0;
+    padding: 10px;
+    border: 1px solid #dfe5ec;
+    border-radius: 4px;
+    background-color: white;
+    color: #1f2937;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    font-size: 0.84rem;
+    line-height: 1.45;
+    white-space: pre-wrap;
+}
+
+.ai-followup-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-top: 10px;
+}
+
+.ai-tool-calls {
+    margin-top: 10px;
+}
+
+.ai-tool-calls summary {
+    cursor: pointer;
+    color: #0f3460;
+    font-size: 0.84rem;
+    font-weight: 700;
+}
+
+.ai-tool-calls pre {
+    max-height: 240px;
+    overflow: auto;
+    margin-top: 8px;
+    padding: 10px;
+    border-radius: 4px;
+    background-color: #f1f5f9;
+    color: #263447;
+    font-size: 0.78rem;
+    white-space: pre-wrap;
 }

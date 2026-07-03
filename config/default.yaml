@@ -3,10 +3,11 @@ mode: analyze
 
 # LLM Service Configuration
 llm:
-  provider: "ollama"
-  url: "http://127.0.0.1:11434"
-  api_key: "${LLM_API_KEY}"
-  model: "llama3.1"
+  # Local default is an OpenAI-compatible model server on port 8080.
+  provider: "openai"
+  url: "http://127.0.0.1:8080/v1"
+  api_key: "local"
+  model: "local-model"
   temperature: 0.1
 
 # Abuse-report email delivery.
