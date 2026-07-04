@@ -18,6 +18,7 @@ use autoagents::core::agent::AgentExecutor;
 use autoagents::core::agent::Context;
 use autoagents::core::agent::prebuilt::executor::ReActAgent;
 use autoagents::core::agent::task::Task;
+use autoagents_llm::chat::ChatMessage;
 
 fn is_valid_ip(ip: &str) -> bool {
     ip.parse::<std::net::IpAddr>().is_ok()
@@ -189,6 +190,7 @@ pub struct AppState {
     pub email_client: crate::email::EmailClient,
     pub agent: Option<Arc<DevOpsAgent>>,
     pub agent_error: Option<String>,
+    pub block_apply_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 pub fn create_router(state: AppState) -> Router {
@@ -222,65 +224,55 @@ async fn health_check() -> impl IntoResponse {
 }
 
 async fn get_incidents(State(state): State<AppState>) -> impl IntoResponse {
+    let started = std::time::Instant::now();
     match crate::db::queries::get_all_incidents(&state.db_pool).await {
         Ok(incidents) => {
-            let mut responses = Vec::with_capacity(incidents.len());
-            for incident in incidents {
-                let block_action = match crate::db::queries::get_latest_action_by_incident_and_type(
-                    &state.db_pool,
-                    &incident.id,
-                    "block_ip",
-                )
-                .await
+            let incident_ids = incidents
+                .iter()
+                .map(|incident| incident.id.clone())
+                .collect::<Vec<_>>();
+            let actions =
+                match crate::db::queries::get_actions_for_incidents(&state.db_pool, &incident_ids)
+                    .await
                 {
-                    Ok(action) => action,
+                    Ok(actions) => actions,
                     Err(e) => {
-                        tracing::error!(
-                            "Failed to get latest block action for incident {}: {}",
-                            incident.id,
-                            e
-                        );
-                        None
+                        tracing::error!("Failed to get incident actions in bulk: {}", e);
+                        Vec::new()
                     }
                 };
-                let report_action =
-                    match crate::db::queries::get_latest_action_by_incident_and_type(
-                        &state.db_pool,
-                        &incident.id,
-                        "report_abuse",
-                    )
-                    .await
-                    {
-                        Ok(action) => action,
-                        Err(e) => {
-                            tracing::error!(
-                                "Failed to get latest abuse-report action for incident {}: {}",
-                                incident.id,
-                                e
-                            );
-                            None
-                        }
-                    };
-                let sent_report_action =
-                    match crate::db::queries::get_latest_action_by_incident_type_and_status(
-                        &state.db_pool,
-                        &incident.id,
-                        "report_abuse",
-                        "completed",
-                    )
-                    .await
-                    {
-                        Ok(action) => action,
-                        Err(e) => {
-                            tracing::error!(
-                                "Failed to get completed abuse-report action for incident {}: {}",
-                                incident.id,
-                                e
-                            );
-                            None
-                        }
-                    };
-                let cluster_blocked = check_cluster_block(&state, &incident.source_ip).await;
+
+            let mut latest_action_by_incident_type = BTreeMap::new();
+            let mut latest_completed_report_by_incident = BTreeMap::new();
+            for action in actions {
+                let key = (action.incident_id.clone(), action.action_type.clone());
+                latest_action_by_incident_type
+                    .entry(key)
+                    .or_insert_with(|| action.clone());
+                if action.action_type == "report_abuse" && action.status == "completed" {
+                    latest_completed_report_by_incident
+                        .entry(action.incident_id.clone())
+                        .or_insert(action);
+                }
+            }
+
+            let cluster_blocked_ips = fetch_cluster_block_cidrs(&state).await.map(|cidrs| {
+                cidrs
+                    .into_iter()
+                    .map(|cidr| ip_from_cidr(&cidr))
+                    .collect::<BTreeSet<_>>()
+            });
+
+            let mut responses = Vec::with_capacity(incidents.len());
+            for incident in incidents {
+                let block_action = latest_action_by_incident_type
+                    .remove(&(incident.id.clone(), "block_ip".to_string()));
+                let report_action = latest_action_by_incident_type
+                    .remove(&(incident.id.clone(), "report_abuse".to_string()));
+                let sent_report_action = latest_completed_report_by_incident.remove(&incident.id);
+                let cluster_blocked = cluster_blocked_ips
+                    .as_ref()
+                    .map(|ips| ips.contains(&incident.source_ip));
                 responses.push(IncidentResponse::from_incident_and_action(
                     incident,
                     block_action,
@@ -289,6 +281,12 @@ async fn get_incidents(State(state): State<AppState>) -> impl IntoResponse {
                     cluster_blocked,
                 ));
             }
+            tracing::info!(
+                incident_count = responses.len(),
+                cluster_verified = cluster_blocked_ips.is_some(),
+                elapsed_ms = started.elapsed().as_millis(),
+                "Loaded incidents"
+            );
             (
                 StatusCode::OK,
                 Json(ApiResponse {
@@ -308,30 +306,6 @@ async fn get_incidents(State(state): State<AppState>) -> impl IntoResponse {
                     message: Some(format!("Failed to get incidents: {}", e)),
                 }),
             )
-        }
-    }
-}
-
-async fn check_cluster_block(state: &AppState, ip: &str) -> Option<bool> {
-    let client = state.k8s_client.as_ref()?;
-    let mut blocker =
-        crate::k8s::TraefikBlocker::new((**client).clone(), state.block_namespace.clone());
-    if let Err(e) = blocker.init_with_detection().await {
-        tracing::warn!(
-            "Could not initialize Traefik blocker for block check: {}",
-            e
-        );
-        return None;
-    }
-
-    match blocker
-        .is_ip_blocked_at_edge(ip, &state.edge_ingressroute_name)
-        .await
-    {
-        Ok(blocked) => Some(blocked),
-        Err(e) => {
-            tracing::warn!("Could not verify cluster block for {}: {}", ip, e);
-            None
         }
     }
 }
@@ -906,6 +880,7 @@ async fn ai_inspect_incident(
         }
     };
 
+    let evidence_start = std::time::Instant::now();
     let (log_evidence, evidence_note) =
         match fetch_abuse_report_log_evidence(&state, &incident).await {
             Ok(events) => (events, None),
@@ -918,6 +893,14 @@ async fn ai_inspect_incident(
                 (Vec::new(), Some(e.to_string()))
             }
         };
+    let evidence_elapsed = evidence_start.elapsed();
+    tracing::info!(
+        incident_id = %incident.id,
+        source_ip = %incident.source_ip,
+        evidence_count = log_evidence.len(),
+        elapsed_ms = evidence_elapsed.as_millis(),
+        "AI inspection evidence fetch completed"
+    );
 
     let prompt = build_ai_inspection_prompt(
         &incident,
@@ -926,32 +909,44 @@ async fn ai_inspect_incident(
         &log_evidence,
         evidence_note.as_deref(),
     );
-    let task = Task::new(prompt);
-    let context = Arc::new(Context::new(agent.llm().clone(), None));
-    let react_agent = ReActAgent::with_max_turns(agent, 8);
-
-    match react_agent.execute(&task, context).await {
+    let messages = vec![ChatMessage::user().content(prompt).build()];
+    let llm_start = std::time::Instant::now();
+    match agent.llm().chat(&messages, None).await {
         Ok(output) => {
-            let tool_calls =
-                serde_json::to_value(&output.tool_calls).unwrap_or_else(|_| serde_json::json!([]));
+            let llm_elapsed = llm_start.elapsed();
+            tracing::info!(
+                incident_id = %incident.id,
+                source_ip = %incident.source_ip,
+                elapsed_ms = llm_elapsed.as_millis(),
+                "AI inspection direct LLM call completed"
+            );
             let response = AiInspectResponse {
                 incident_id: incident.id,
                 source_ip: incident.source_ip,
-                analysis: output.response,
+                analysis: output.text().unwrap_or_default(),
                 evidence_count: log_evidence.len(),
-                tool_calls,
-                done: output.done,
+                tool_calls: serde_json::json!([]),
+                done: true,
             };
             (StatusCode::OK, Json(ApiResponse::new(response)))
         }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ApiResponse::<AiInspectResponse> {
-                success: false,
-                data: None,
-                message: Some(format!("AI inspection failed: {}", e)),
-            }),
-        ),
+        Err(e) => {
+            tracing::error!(
+                incident_id = %incident.id,
+                source_ip = %incident.source_ip,
+                elapsed_ms = llm_start.elapsed().as_millis(),
+                "AI inspection direct LLM call failed: {}",
+                e
+            );
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiResponse::<AiInspectResponse> {
+                    success: false,
+                    data: None,
+                    message: Some(format!("AI inspection failed: {}", e)),
+                }),
+            )
+        }
     }
 }
 
@@ -1093,29 +1088,70 @@ async fn send_abuse_report(
         );
     }
 
-    let action_id = format!(
-        "action-report-abuse-{}-{}",
-        incident.source_ip,
-        chrono::Utc::now().timestamp_millis()
-    );
-    if let Err(e) =
-        crate::db::queries::create_action(&state.db_pool, &action_id, &incident.id, "report_abuse")
-            .await
+    let action_id = format!("action-report-abuse-{}", incident.id);
+    let action_id = match crate::db::queries::claim_action(
+        &state.db_pool,
+        &action_id,
+        &incident.id,
+        "report_abuse",
+        request.force,
+    )
+    .await
     {
-        tracing::error!(
-            "Failed to record abuse-report action for {}: {}",
-            incident.source_ip,
-            e
-        );
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ApiResponse::<AbuseReportResponse> {
-                success: false,
-                data: None,
-                message: Some(format!("Failed to record abuse-report action: {}", e)),
-            }),
-        );
-    }
+        Ok(crate::db::queries::ActionClaimResult::Claimed(action)) => action.id,
+        Ok(crate::db::queries::ActionClaimResult::AlreadyCompleted(action)) => {
+            let sent_at = Some(action.updated_at);
+            return (
+                StatusCode::CONFLICT,
+                Json(ApiResponse {
+                    success: false,
+                    data: Some(AbuseReportResponse {
+                        incident_id: incident.id,
+                        source_ip: incident.source_ip,
+                        provider: state.email_client.provider_name(),
+                        recipients: Vec::new(),
+                        sandbox_mode: false,
+                        already_sent: true,
+                        sent_at: sent_at.clone(),
+                        evidence_count: 0,
+                        provider_response: serde_json::json!({}),
+                    }),
+                    message: Some(format!(
+                        "Abuse report was already sent for this incident at {}. Use Send Again to override.",
+                        sent_at.unwrap_or_else(|| "an earlier time".to_string())
+                    )),
+                }),
+            );
+        }
+        Ok(crate::db::queries::ActionClaimResult::AlreadyInProgress(action)) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(ApiResponse::<AbuseReportResponse> {
+                    success: false,
+                    data: None,
+                    message: Some(format!(
+                        "Abuse report is already {} for this incident. Refresh before trying again.",
+                        action.status
+                    )),
+                }),
+            );
+        }
+        Err(e) => {
+            tracing::error!(
+                "Failed to claim abuse-report action for {}: {}",
+                incident.source_ip,
+                e
+            );
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiResponse::<AbuseReportResponse> {
+                    success: false,
+                    data: None,
+                    message: Some(format!("Failed to record abuse-report action: {}", e)),
+                }),
+            );
+        }
+    };
 
     let whois = match state.whois_client.lookup_ip(&incident.source_ip).await {
         Ok(info) => info,
@@ -1835,6 +1871,55 @@ fn html_escape(value: &str) -> String {
         .replace('\'', "&#39;")
 }
 
+fn incident_status_label(status: &str) -> &str {
+    match status {
+        "detected" => "detected",
+        "approved" => "already approved",
+        "rejected" => "already dismissed",
+        _ => status,
+    }
+}
+
+async fn incident_decision_conflict_response(
+    state: &AppState,
+    incident_id: &str,
+    attempted_action: &str,
+) -> (StatusCode, Json<ApiResponse<()>>) {
+    match crate::db::queries::get_incident(&state.db_pool, incident_id).await {
+        Ok(Some(incident)) => (
+            StatusCode::CONFLICT,
+            Json(ApiResponse::<()> {
+                success: false,
+                data: None,
+                message: Some(format!(
+                    "Incident is {}; refresh before trying to {} it.",
+                    incident_status_label(&incident.status),
+                    attempted_action
+                )),
+            }),
+        ),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(ApiResponse::<()> {
+                success: false,
+                data: None,
+                message: Some("Incident not found".to_string()),
+            }),
+        ),
+        Err(e) => {
+            tracing::error!("Failed to get incident after decision conflict: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiResponse::<()> {
+                    success: false,
+                    data: None,
+                    message: Some(format!("Failed to get incident: {}", e)),
+                }),
+            )
+        }
+    }
+}
+
 /// Approving an incident confirms the recommended block for its source IP.
 /// The incident is marked `approved` and, when enforcement is enabled, the
 /// configured Traefik edge deny route is updated. The action is recorded either
@@ -1843,44 +1928,30 @@ async fn approve_incident(
     State(state): State<AppState>,
     Path(incident_id): Path<String>,
 ) -> impl IntoResponse {
-    let incident = match crate::db::queries::get_incident(&state.db_pool, &incident_id).await {
+    let incident = match crate::db::queries::update_incident_status_from(
+        &state.db_pool,
+        &incident_id,
+        "approved",
+        &["detected"],
+    )
+    .await
+    {
         Ok(Some(incident)) => incident,
         Ok(None) => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(ApiResponse::<()> {
-                    success: false,
-                    data: None,
-                    message: Some("Incident not found".to_string()),
-                }),
-            );
+            return incident_decision_conflict_response(&state, &incident_id, "approve").await;
         }
         Err(e) => {
-            tracing::error!("Failed to get incident: {}", e);
+            tracing::error!("Failed to approve incident: {}", e);
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ApiResponse::<()> {
                     success: false,
                     data: None,
-                    message: Some(format!("Failed to get incident: {}", e)),
+                    message: Some(format!("Failed to update incident status: {}", e)),
                 }),
             );
         }
     };
-
-    if let Err(e) =
-        crate::db::queries::update_incident_status(&state.db_pool, &incident_id, "approved").await
-    {
-        tracing::error!("Failed to update incident status: {}", e);
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ApiResponse::<()> {
-                success: false,
-                data: None,
-                message: Some(format!("Failed to update incident status: {}", e)),
-            }),
-        );
-    }
 
     let outcome = enforce_block(&state, &incident, state.enforce).await;
     (
@@ -1899,44 +1970,31 @@ async fn apply_block_override(
     State(state): State<AppState>,
     Path(incident_id): Path<String>,
 ) -> impl IntoResponse {
-    let incident = match crate::db::queries::get_incident(&state.db_pool, &incident_id).await {
+    let incident = match crate::db::queries::update_incident_status_from(
+        &state.db_pool,
+        &incident_id,
+        "approved",
+        &["detected", "approved"],
+    )
+    .await
+    {
         Ok(Some(incident)) => incident,
         Ok(None) => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(ApiResponse::<()> {
-                    success: false,
-                    data: None,
-                    message: Some("Incident not found".to_string()),
-                }),
-            );
+            return incident_decision_conflict_response(&state, &incident_id, "apply a block for")
+                .await;
         }
         Err(e) => {
-            tracing::error!("Failed to get incident: {}", e);
+            tracing::error!("Failed to approve incident for block override: {}", e);
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ApiResponse::<()> {
                     success: false,
                     data: None,
-                    message: Some(format!("Failed to get incident: {}", e)),
+                    message: Some(format!("Failed to update incident status: {}", e)),
                 }),
             );
         }
     };
-
-    if let Err(e) =
-        crate::db::queries::update_incident_status(&state.db_pool, &incident_id, "approved").await
-    {
-        tracing::error!("Failed to update incident status: {}", e);
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ApiResponse::<()> {
-                success: false,
-                data: None,
-                message: Some(format!("Failed to update incident status: {}", e)),
-            }),
-        );
-    }
 
     let outcome = enforce_block(&state, &incident, true).await;
     (
@@ -1987,6 +2045,8 @@ async fn enforce_block(
             dry_run: true,
         };
     }
+
+    let _block_guard = state.block_apply_lock.lock().await;
 
     let Some(client) = state.k8s_client.clone() else {
         let _ =
@@ -2058,52 +2118,31 @@ async fn reject_incident(
     State(state): State<AppState>,
     Path(incident_id): Path<String>,
 ) -> impl IntoResponse {
-    match crate::db::queries::get_incident(&state.db_pool, &incident_id).await {
-        Ok(Some(_)) => {
-            match crate::db::queries::update_incident_status(
-                &state.db_pool,
-                &incident_id,
-                "rejected",
-            )
-            .await
-            {
-                Ok(_) => (
-                    StatusCode::OK,
-                    Json(ApiResponse::<()> {
-                        success: true,
-                        data: None,
-                        message: Some("Incident rejected".to_string()),
-                    }),
-                ),
-                Err(e) => {
-                    tracing::error!("Failed to update incident status: {}", e);
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(ApiResponse::<()> {
-                            success: false,
-                            data: None,
-                            message: Some(format!("Failed to update incident status: {}", e)),
-                        }),
-                    )
-                }
-            }
-        }
-        Ok(None) => (
-            StatusCode::NOT_FOUND,
+    match crate::db::queries::update_incident_status_from(
+        &state.db_pool,
+        &incident_id,
+        "rejected",
+        &["detected"],
+    )
+    .await
+    {
+        Ok(Some(_)) => (
+            StatusCode::OK,
             Json(ApiResponse::<()> {
-                success: false,
+                success: true,
                 data: None,
-                message: Some("Incident not found".to_string()),
+                message: Some("Incident rejected".to_string()),
             }),
         ),
+        Ok(None) => incident_decision_conflict_response(&state, &incident_id, "dismiss").await,
         Err(e) => {
-            tracing::error!("Failed to get incident: {}", e);
+            tracing::error!("Failed to reject incident: {}", e);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ApiResponse::<()> {
                     success: false,
                     data: None,
-                    message: Some(format!("Failed to get incident: {}", e)),
+                    message: Some(format!("Failed to update incident status: {}", e)),
                 }),
             )
         }

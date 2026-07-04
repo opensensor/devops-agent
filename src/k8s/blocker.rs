@@ -318,86 +318,121 @@ impl TraefikBlocker {
         let apis: Api<DynamicObject> =
             Api::namespaced_with(self.client.clone(), &self.namespace, &api_resource);
 
-        let existing = match apis.get(ingressroute_name).await {
-            Ok(route) => route,
-            Err(e) => {
-                return Err(BlockerError::from_kube_error(
-                    &e,
-                    "get edge deny ingressroute",
-                ));
+        const MAX_PATCH_ATTEMPTS: usize = 5;
+        for attempt in 1..=MAX_PATCH_ATTEMPTS {
+            let existing = match apis.get(ingressroute_name).await {
+                Ok(route) => route,
+                Err(e) => {
+                    return Err(BlockerError::from_kube_error(
+                        &e,
+                        "get edge deny ingressroute",
+                    ));
+                }
+            };
+
+            let resource_version = existing.metadata.resource_version.clone();
+            let mut spec = existing
+                .data
+                .get("spec")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({}));
+
+            let entry_points = spec
+                .get("entryPoints")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!(["websecure"]));
+
+            let mut routes = spec
+                .get_mut("routes")
+                .and_then(|routes| routes.as_array_mut().map(std::mem::take))
+                .unwrap_or_default();
+
+            let mut changed = false;
+            if routes.is_empty() {
+                routes.push(serde_json::json!({
+                    "kind": "Rule",
+                    "match": client_ip_rule.clone(),
+                    "priority": 100001,
+                    "services": [{
+                        "name": service_name,
+                        "port": service_port
+                    }]
+                }));
+                changed = true;
+            } else {
+                let route = &mut routes[0];
+                let current_match = route.get("match").and_then(|m| m.as_str()).unwrap_or("");
+                if !current_match.contains(&client_ip_rule) {
+                    let next_match = if current_match.trim().is_empty() {
+                        client_ip_rule.clone()
+                    } else {
+                        format!("{} || {}", current_match, client_ip_rule)
+                    };
+                    route["match"] = serde_json::Value::String(next_match);
+                    changed = true;
+                }
+
+                if route.get("kind").is_none() {
+                    route["kind"] = serde_json::Value::String("Rule".to_string());
+                    changed = true;
+                }
+                if route.get("priority").is_none() {
+                    route["priority"] = serde_json::json!(100001);
+                    changed = true;
+                }
+                if route.get("services").is_none() {
+                    route["services"] = serde_json::json!([{
+                        "name": service_name,
+                        "port": service_port
+                    }]);
+                    changed = true;
+                }
             }
-        };
 
-        let mut spec = existing
-            .data
-            .get("spec")
-            .cloned()
-            .unwrap_or_else(|| serde_json::json!({}));
-
-        let entry_points = spec
-            .get("entryPoints")
-            .cloned()
-            .unwrap_or_else(|| serde_json::json!(["websecure"]));
-
-        let mut routes = spec
-            .get_mut("routes")
-            .and_then(|routes| routes.as_array_mut().map(std::mem::take))
-            .unwrap_or_default();
-
-        if routes.is_empty() {
-            routes.push(serde_json::json!({
-                "kind": "Rule",
-                "match": client_ip_rule,
-                "priority": 100001,
-                "services": [{
-                    "name": service_name,
-                    "port": service_port
-                }]
-            }));
-        } else {
-            let route = &mut routes[0];
-            let current_match = route.get("match").and_then(|m| m.as_str()).unwrap_or("");
-            if !current_match.contains(&client_ip_rule) {
-                let next_match = if current_match.trim().is_empty() {
-                    client_ip_rule
-                } else {
-                    format!("{} || {}", current_match, client_ip_rule)
-                };
-                route["match"] = serde_json::Value::String(next_match);
+            if !changed {
+                return Ok(ingressroute_name.to_string());
             }
 
-            if route.get("kind").is_none() {
-                route["kind"] = serde_json::Value::String("Rule".to_string());
+            let mut patch_data = serde_json::json!({
+                "spec": {
+                    "entryPoints": entry_points,
+                    "routes": routes
+                }
+            });
+            if let Some(resource_version) = resource_version {
+                patch_data["metadata"] = serde_json::json!({
+                    "resourceVersion": resource_version
+                });
             }
-            if route.get("priority").is_none() {
-                route["priority"] = serde_json::json!(100001);
-            }
-            if route.get("services").is_none() {
-                route["services"] = serde_json::json!([{
-                    "name": service_name,
-                    "port": service_port
-                }]);
+
+            let pp = PatchParams::default();
+            let patch = Patch::Merge(&patch_data);
+
+            match apis.patch(ingressroute_name, &pp, &patch).await {
+                Ok(_) => return Ok(ingressroute_name.to_string()),
+                Err(e) if is_kube_conflict(&e) && attempt < MAX_PATCH_ATTEMPTS => {
+                    tracing::debug!(
+                        "Retrying edge deny IngressRoute patch after resource conflict ({}/{})",
+                        attempt,
+                        MAX_PATCH_ATTEMPTS
+                    );
+                }
+                Err(e) => {
+                    return Err(BlockerError::from_kube_error(
+                        &e,
+                        "patch edge deny ingressroute",
+                    ));
+                }
             }
         }
 
-        let patch_data = serde_json::json!({
-            "spec": {
-                "entryPoints": entry_points,
-                "routes": routes
-            }
-        });
-        let pp = PatchParams::default();
-        let patch = Patch::Merge(&patch_data);
-
-        match apis.patch(ingressroute_name, &pp, &patch).await {
-            Ok(_) => Ok(ingressroute_name.to_string()),
-            Err(e) => Err(BlockerError::from_kube_error(
-                &e,
-                "patch edge deny ingressroute",
-            )),
-        }
+        Err(BlockerError::ResourceConflict(format!(
+            "patch edge deny ingressroute failed after {} attempts",
+            MAX_PATCH_ATTEMPTS
+        )))
     }
 
+    #[allow(dead_code)]
     pub async fn is_ip_blocked_at_edge(
         &self,
         ip: &str,
@@ -609,6 +644,10 @@ impl TraefikBlocker {
             }
         }
     }
+}
+
+fn is_kube_conflict(err: &kube::Error) -> bool {
+    matches!(err, kube::Error::Api(response) if response.code == 409)
 }
 
 fn extract_client_ip_match_values(rule: &str) -> Vec<String> {

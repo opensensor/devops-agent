@@ -230,6 +230,7 @@ async fn main() {
                         email_client: email::EmailClient::new(config.email.clone()),
                         agent,
                         agent_error,
+                        block_apply_lock: Arc::new(tokio::sync::Mutex::new(())),
                     };
 
                     tracing::info!(

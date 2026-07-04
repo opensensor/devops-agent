@@ -36,6 +36,13 @@ pub struct ActionDb {
     pub updated_at: String,
 }
 
+#[derive(Debug, Clone)]
+pub enum ActionClaimResult {
+    Claimed(ActionDb),
+    AlreadyCompleted(ActionDb),
+    AlreadyInProgress(ActionDb),
+}
+
 pub async fn is_ip_allowlisted(pool: &sqlx::SqlitePool, ip: &str) -> Result<bool, sqlx::Error> {
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM allowlist_ips WHERE ip = ?")
         .bind(ip)
@@ -129,6 +136,7 @@ pub async fn get_all_incidents(pool: &sqlx::SqlitePool) -> Result<Vec<IncidentDb
     .await
 }
 
+#[allow(dead_code)]
 pub async fn update_incident_status(
     pool: &sqlx::SqlitePool,
     id: &str,
@@ -142,6 +150,50 @@ pub async fn update_incident_status(
     Ok(())
 }
 
+pub async fn update_incident_status_from(
+    pool: &sqlx::SqlitePool,
+    id: &str,
+    status: &str,
+    allowed_current_statuses: &[&str],
+) -> Result<Option<IncidentDb>, sqlx::Error> {
+    if allowed_current_statuses.is_empty() {
+        return Ok(None);
+    }
+
+    let placeholders = std::iter::repeat("?")
+        .take(allowed_current_statuses.len())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "UPDATE incidents \
+         SET status = ?, updated_at = CURRENT_TIMESTAMP \
+         WHERE id = ? AND status IN ({})",
+        placeholders
+    );
+
+    let mut tx = pool.begin().await?;
+    let mut query = sqlx::query(&sql).bind(status).bind(id);
+    for current_status in allowed_current_statuses {
+        query = query.bind(*current_status);
+    }
+
+    let result = query.execute(&mut *tx).await?;
+    if result.rows_affected() == 0 {
+        tx.commit().await?;
+        return Ok(None);
+    }
+
+    let incident = sqlx::query_as::<_, IncidentDb>(
+        "SELECT id, source_ip, detected_at, status, failure_count, details, created_at, updated_at FROM incidents WHERE id = ?",
+    )
+    .bind(id)
+    .fetch_one(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+    Ok(Some(incident))
+}
+
 pub async fn create_action(
     pool: &sqlx::SqlitePool,
     id: &str,
@@ -149,7 +201,16 @@ pub async fn create_action(
     action_type: &str,
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
-        "INSERT OR REPLACE INTO actions (id, incident_id, action_type, status, created_at, updated_at) VALUES (?, ?, ?, 'pending', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+        "INSERT INTO actions (id, incident_id, action_type, status, created_at, updated_at) \
+         VALUES (?, ?, ?, 'pending', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP) \
+         ON CONFLICT(id) DO UPDATE SET \
+             incident_id = excluded.incident_id, \
+             action_type = excluded.action_type, \
+             status = CASE \
+                 WHEN actions.status = 'completed' AND excluded.action_type = 'block_ip' THEN actions.status \
+                 ELSE 'pending' \
+             END, \
+             updated_at = CURRENT_TIMESTAMP",
     )
     .bind(id)
     .bind(incident_id)
@@ -157,6 +218,57 @@ pub async fn create_action(
     .execute(pool)
     .await?;
     Ok(())
+}
+
+pub async fn claim_action(
+    pool: &sqlx::SqlitePool,
+    id: &str,
+    incident_id: &str,
+    action_type: &str,
+    force_completed: bool,
+) -> Result<ActionClaimResult, sqlx::Error> {
+    let result = sqlx::query(
+        "INSERT INTO actions (id, incident_id, action_type, status, created_at, updated_at) \
+         VALUES (?, ?, ?, 'pending', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP) \
+         ON CONFLICT(id) DO UPDATE SET \
+             incident_id = excluded.incident_id, \
+             action_type = excluded.action_type, \
+             status = 'pending', \
+             updated_at = CURRENT_TIMESTAMP \
+         WHERE actions.status = 'failed' OR (? AND actions.status = 'completed')",
+    )
+    .bind(id)
+    .bind(incident_id)
+    .bind(action_type)
+    .bind(force_completed)
+    .execute(pool)
+    .await?;
+
+    let action = get_action(pool, id)
+        .await?
+        .ok_or(sqlx::Error::RowNotFound)?;
+
+    if result.rows_affected() > 0 {
+        return Ok(ActionClaimResult::Claimed(action));
+    }
+
+    if action.status == "completed" {
+        Ok(ActionClaimResult::AlreadyCompleted(action))
+    } else {
+        Ok(ActionClaimResult::AlreadyInProgress(action))
+    }
+}
+
+pub async fn get_action(
+    pool: &sqlx::SqlitePool,
+    id: &str,
+) -> Result<Option<ActionDb>, sqlx::Error> {
+    sqlx::query_as::<_, ActionDb>(
+        "SELECT id, incident_id, action_type, status, created_at, updated_at FROM actions WHERE id = ?",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await
 }
 
 #[allow(dead_code)]
@@ -213,6 +325,34 @@ pub async fn get_latest_action_by_incident_type_and_status(
     .bind(status)
     .fetch_optional(pool)
     .await
+}
+
+pub async fn get_actions_for_incidents(
+    pool: &sqlx::SqlitePool,
+    incident_ids: &[String],
+) -> Result<Vec<ActionDb>, sqlx::Error> {
+    if incident_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let placeholders = std::iter::repeat("?")
+        .take(incident_ids.len())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "SELECT id, incident_id, action_type, status, created_at, updated_at \
+         FROM actions \
+         WHERE incident_id IN ({}) AND action_type IN ('block_ip', 'report_abuse') \
+         ORDER BY updated_at DESC, created_at DESC",
+        placeholders
+    );
+
+    let mut query = sqlx::query_as::<_, ActionDb>(&sql);
+    for incident_id in incident_ids {
+        query = query.bind(incident_id);
+    }
+
+    query.fetch_all(pool).await
 }
 
 #[allow(dead_code)]

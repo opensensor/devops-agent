@@ -4,6 +4,12 @@ DevOps Agent detects suspicious edge traffic from Elasticsearch logs, opens inci
 
 The default workflow is local-first: run the SPA on your workstation, port-forward Elasticsearch when needed, review incidents, then explicitly approve blocks and reports.
 
+## Demo
+
+<video src="./demo.webm" controls preload="metadata" width="100%">
+  <a href="./demo.webm">Watch the demo</a>
+</video>
+
 ## Features
 
 - Scheduled detection of repeated authentication failures in Traefik-style access logs.
