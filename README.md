@@ -6,9 +6,9 @@ The default workflow is local-first: run the SPA on your workstation, port-forwa
 
 ## Demo
 
-<video src="./demo.webm" controls preload="metadata" width="100%">
-  <a href="./demo.webm">Watch the demo</a>
-</video>
+[![DevOps Agent demo showing the incident review UI](docs/demo-poster.png)](demo.webm)
+
+[Watch the demo video](demo.webm)
 
 ## Features
 
